@@ -1,7 +1,8 @@
 # OUTPOST // 01 v0.6 | Sharper weather icons & a plain-language Today screen
 # A: Home (hold ~2 sec to retry weather) | B: Forecast | C: Today | D: Reactor
 # In reactor: press A-D for cells, hold D ~2 sec to exit.
-# Original v0.3 M-01 robot and window kept pixel-identical (weather scene static).
+# Original v0.3 M-01 robot and room kept pixel-identical; the view out the
+# window now follows the weather (scenes.bmp, made by tools/make_scenes.py).
 
 import os
 import gc
@@ -88,6 +89,14 @@ for style in font_files:
 icon_sheets = {
     "small": (displayio.OnDiskBitmap("/icons.bmp"), 30, 24),
     "big": (displayio.OnDiskBitmap("/icons_big.bmp"), 50, 40),
+}
+# Home-screen window views: one 134x79 tile per weather, drawn over home.bmp.
+# Tile order is set by tools/make_scenes.py and must match SCENE_INDEX.
+scenes_bitmap = displayio.OnDiskBitmap("/scenes.bmp")
+SCENE_X, SCENE_Y, SCENE_W, SCENE_H = 28, 22, 134, 79
+SCENE_INDEX = {
+    "CLEAR": 0, "PARTLY": 1, "CLOUDY": 2, "FOG": 3, "RAIN": 4, "SNOW": 5,
+    "STORM": 6, "NIGHT": 7, "NIGHT_PARTLY": 8, "NIGHT_CLOUDY": 9,
 }
 ICON_INDEX = {
     "CLEAR": 0, "PARTLY": 1, "CLOUDY": 2, "FOG": 3, "DRIZZLE": 4,
@@ -319,7 +328,6 @@ def fetch_weather():
         del data, hourly
         status = "ONLINE"
         print("WEATHER OK:", weather["temp"], readable_condition(weather["code"]))
-        print("SCENE:", condition(weather["code"]))
         flash((0, 65, 0), 0.9)
     except Exception as error:
         status = "OFFLINE"
@@ -330,7 +338,27 @@ def fetch_weather():
     gc.collect()
 
 
+def scene_for(w):
+    state = condition(w["code"])
+    if state in ("RAIN", "DRIZZLE"):
+        return "RAIN"
+    if state in ("STORM", "SNOW"):
+        return state
+    if not w["is_day"]:
+        return {"CLEAR": "NIGHT", "PARTLY": "NIGHT_PARTLY"}.get(state, "NIGHT_CLOUDY")
+    return state  # CLEAR, PARTLY, CLOUDY or FOG
+
+
 def home_overlay(group):
+    # The view out the window. With no weather yet, home.bmp's rainy view stays.
+    if weather:
+        scene = scene_for(weather)
+        print("SCENE:", scene)
+        group.append(displayio.TileGrid(
+            scenes_bitmap, pixel_shader=scenes_bitmap.pixel_shader,
+            width=1, height=1, tile_width=SCENE_W, tile_height=SCENE_H,
+            x=SCENE_X, y=SCENE_Y, default_tile=SCENE_INDEX[scene]
+        ))
     # Original M-01 robot/window pixels are unchanged. Header shows weather location.
     city = "".join(c if c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789- " else " "
                    for c in LOCATION_LABEL.upper()).strip()
