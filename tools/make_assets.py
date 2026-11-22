@@ -7,6 +7,7 @@ Writes into the repo root:
   icons_big.bmp  Today-screen icons, 10 tiles of 50x40
   text.bmp       6x13 mixed-case text font, ASCII 32-126 plus a degree sign
   today.bmp      Button C "Today" screen background
+  signal.bmp     Button D game screen background
   forecast.bmp   footer label updated to "C TODAY" (rest left untouched)
 
 Icons are drawn as vector shapes at 8x resolution, then shrunk and snapped
@@ -282,6 +283,17 @@ def today_background():
     save_bmp(img, "today.bmp")
 
 
+def signal_background():
+    """Button D game screen: frame, header rule, and a rule above the
+    A/B/C/D color labels that code.py prints along the bottom."""
+    img = frame_from("forecast.bmp")
+    d = ImageDraw.Draw(img)
+    d.line([8, 103, 287, 103], fill=LIGHT)
+    for x in (74, 148, 222):                     # dividers between labels
+        d.line([x, 106, x, 119], fill=LIGHT)
+    save_bmp(img, "signal.bmp")
+
+
 def forecast_footer(font_img):
     """Repaint the forecast footer cleanly with the new button names."""
     img = Image.open(os.path.join(ROOT, "forecast.bmp")).convert("L")
@@ -330,6 +342,7 @@ def main():
         print("font not found, keeping existing text.bmp:", args.font)
         font = Image.open(os.path.join(ROOT, "text.bmp")).convert("L")
     today_background()
+    signal_background()
     if not args.skip_forecast:
         forecast_footer(font)
     if args.preview:

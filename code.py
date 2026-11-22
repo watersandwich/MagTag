@@ -1,6 +1,6 @@
 # OUTPOST // 01 v0.6 | Sharper weather icons & a plain-language Today screen
-# A: Home (hold ~2 sec to retry weather) | B: Forecast | C: Today | D: Reactor
-# In reactor: press A-D for cells, hold D ~2 sec to exit.
+# A: Home (hold ~2 sec to retry weather) | B: Forecast | C: Today | D: Signal game
+# In the game: repeat the light/tone pattern with A-D; hold D ~2 sec to exit.
 # Original v0.3 M-01 robot and room kept pixel-identical; the view out the
 # window now follows the weather (scenes.bmp, made by tools/make_scenes.py).
 
@@ -26,6 +26,12 @@ LONGITUDE = -74.155012
 # This is the label for the SAME coordinates above, not the device's GPS position.
 # Update all three when monitoring another location.
 LOCATION_LABEL = "Hawthorne"
+# Game sound. Set SOUND to False to play silently; VOLUME is 0-32768.
+SOUND = True
+VOLUME = 0x2000
+# Which NeoPixel sits above each button (A, B, C, D). If the game's lights
+# show up in reverse order on your board, change this to (3, 2, 1, 0).
+LED_FOR_BUTTON = (0, 1, 2, 3)
 UPDATE_SECONDS = 30 * 60
 RETRY_SECONDS = 5 * 60
 
@@ -49,6 +55,19 @@ for pin in (board.BUTTON_A, board.BUTTON_B, board.BUTTON_C, board.BUTTON_D):
     b.switch_to_input(pull=digitalio.Pull.UP)
     buttons.append(b)
 last_pressed = [False] * 4
+# Speaker: a small speaker on board.SPEAKER, with an amplifier switched by
+# board.SPEAKER_ENABLE. Tones are square waves from the built-in pwmio module.
+speaker = None
+speaker_enable = None
+try:
+    import pwmio
+    speaker_enable = digitalio.DigitalInOut(board.SPEAKER_ENABLE)
+    speaker_enable.switch_to_output(value=False)
+    speaker = pwmio.PWMOut(board.SPEAKER, frequency=440, duty_cycle=0,
+                           variable_frequency=True)
+    print("Speaker ready")
+except Exception as error:
+    print("SPEAKER ERROR (game will be silent):", repr(error))
 button_down_at = [0.0] * 4
 
 # The MagTag exposes LiPo battery voltage through an analog pin.
@@ -66,7 +85,7 @@ backgrounds = {
     "HOME": "/home.bmp",
     "FORECAST": "/forecast.bmp",
     "TODAY": "/today.bmp",
-    "GAME": "/reactor.bmp",
+    "GAME": "/signal.bmp",
 }
 # Each tile sheet is a crisp raster monospace font on an appropriate background.
 # All BMP files stay on disk; only their active tiles are displayed.
@@ -110,10 +129,6 @@ last_fetch = -UPDATE_SECONDS
 next_retry = 0
 session = None
 
-reactor_cells = [False] * 4
-reactor_moves = 0
-reactor_won = False
-reactor_best = None
 ignore_entry_release = False
 
 
@@ -123,6 +138,28 @@ def flash(color, duration=0.4):
         return
     leds.fill(color)
     led_until = time.monotonic() + duration
+
+
+def speaker_power(on):
+    if speaker_enable is not None:
+        speaker_enable.value = on and SOUND
+
+
+def tone_on(freq):
+    if speaker is not None and SOUND:
+        speaker.frequency = int(freq)
+        speaker.duty_cycle = VOLUME
+
+
+def tone_off():
+    if speaker is not None:
+        speaker.duty_cycle = 0
+
+
+def beep(freq, duration):
+    tone_on(freq)
+    time.sleep(duration)
+    tone_off()
 
 
 def tile_text(group, message, x, y, style="small"):
@@ -730,14 +767,6 @@ def today_overlay(group):
             tile_text(group, item, 67 + col * 74, 98 + row * 12, "text")
 
 
-def game_overlay(group):
-    if reactor_won:
-        tile_text(group, "CORE STABILIZED", 15, 100)
-        tile_text(group, "MOVES " + str(reactor_moves), 195, 100)
-    else:
-        tile_text(group, "CORE UNSTABLE", 15, 100)
-
-
 def draw():
     print("DISPLAY:", screen)
     filename = backgrounds[screen]
@@ -760,58 +789,214 @@ def draw():
     gc.collect()
 
 
-def toggle_cell(cells, index):
-    for j in (index-1, index, index+1):
-        if 0 <= j < 4:
-            cells[j] = not cells[j]
+# ------------------- SIGNAL GAME (button D) ---------------------------
+# A Simon-style memory game. M-01 plays a coded signal on the lights and
+# speaker; repeat it with the buttons. Each round adds one step and plays a
+# little faster. The e-ink screen only redraws before and after a game.
+
+# Button -> (light color, tone in Hz). Tones are the classic Simon notes.
+SIGNALS = (
+    ((255, 0, 0), 310),     # A red
+    ((255, 170, 0), 252),   # B yellow
+    ((0, 255, 0), 415),     # C green
+    ((0, 60, 255), 209),    # D blue
+)
+SIGNAL_NAMES = ("A red", "B yellow", "C green", "D blue")
+INPUT_TIMEOUT = 6.0      # seconds of no press before the signal is lost
+HOLD_TO_EXIT = 1.8       # hold D this long to leave the game
+
+game_state = "READY"     # READY, PLAYING (your turn) or OVER
+sequence = []
+step = 0
+game_score = 0
+game_best = 0
+new_best = False
+lost_on = 0              # the step number the player missed
+input_deadline = 0
+exit_armed = False
 
 
-def show_reactor_leds():
-    for j in range(4):
-        leds[j] = (90, 0, 0) if reactor_cells[j] else (0, 0, 0)
+def load_best():
+    # The best score is kept in the board's non-volatile memory, so it
+    # survives power-off. Byte 0 marks it as ours, byte 1 is the score.
+    try:
+        import microcontroller
+        if microcontroller.nvm[0] == 0xA5:
+            return microcontroller.nvm[1]
+    except Exception as error:
+        print("NVM READ ERROR:", repr(error))
+    return 0
 
 
-def start_reactor():
-    global reactor_cells, reactor_moves, reactor_won, led_until
-    reactor_cells = [False] * 4
-    # CircuitPython random may not provide random.sample().
-    picks = []
-    wanted = random.randint(2, 3)
-    while len(picks) < wanted:
-        idx = random.randrange(4)
-        if idx not in picks:
-            picks.append(idx)
-            toggle_cell(reactor_cells, idx)
-    reactor_moves = 0
-    reactor_won = False
-    led_until = 0
-    show_reactor_leds()
-    print("REACTOR: press A-D; hold D to leave")
+def save_best(value):
+    try:
+        import microcontroller
+        microcontroller.nvm[0:2] = bytes((0xA5, min(255, value)))
+    except Exception as error:
+        print("NVM WRITE ERROR:", repr(error))
 
 
-def reactor_press(index):
-    global reactor_moves, reactor_won, reactor_best
-    if reactor_won:
-        start_reactor()
-        draw()
-        return
-    toggle_cell(reactor_cells, index)
-    reactor_moves += 1
-    if not any(reactor_cells):
-        reactor_won = True
-        if reactor_best is None or reactor_moves < reactor_best:
-            reactor_best = reactor_moves
-        leds.fill((0, 75, 0))
-        print("REACTOR: STABILIZED in", reactor_moves, "moves")
-        draw()
+def signal_on(i):
+    leds.fill((0, 0, 0))
+    leds[LED_FOR_BUTTON[i]] = SIGNALS[i][0]
+    tone_on(SIGNALS[i][1])
+
+
+def signal_off():
+    leds.fill((0, 0, 0))
+    tone_off()
+
+
+def play_sequence():
+    # Gets quicker each round: 0.45 s per step at the start, 0.18 s at best.
+    on = max(0.18, 0.45 - 0.025 * (len(sequence) - 1))
+    off = max(0.07, on * 0.35)
+    time.sleep(0.5)
+    for i in sequence:
+        signal_on(i)
+        time.sleep(on)
+        signal_off()
+        time.sleep(off)
+
+
+def resync_buttons():
+    # Forget presses made while the sequence was playing.
+    t = time.monotonic()
+    for j, b in enumerate(buttons):
+        last_pressed[j] = not b.value
+        button_down_at[j] = t
+
+
+def next_round():
+    global step, input_deadline
+    sequence.append(random.randrange(4))
+    play_sequence()
+    step = 0
+    resync_buttons()
+    input_deadline = time.monotonic() + INPUT_TIMEOUT
+
+
+def start_game():
+    global game_state, game_score, new_best
+    print("SIGNAL: new game")
+    sequence.clear()
+    game_score = 0
+    new_best = False
+    game_state = "PLAYING"
+    for i in range(4):          # quick "incoming" sweep
+        leds[LED_FOR_BUTTON[i]] = SIGNALS[i][0]
+        beep(600 + i * 150, 0.05)
+    time.sleep(0.15)
+    signal_off()
+    next_round()
+
+
+def round_cleared():
+    global game_score
+    game_score = len(sequence)
+    print("SIGNAL: round", game_score, "cleared")
+    time.sleep(0.15)
+    leds.fill((0, 40, 0))
+    beep(880, 0.06)
+    beep(1175, 0.08)
+    leds.fill((0, 0, 0))
+    time.sleep(0.35)
+    if len(sequence) >= 99:
+        game_over(won=True)
     else:
-        show_reactor_leds()
-        print("REACTOR:", reactor_cells)
+        next_round()
+
+
+def game_over(timeout=False, won=False):
+    global game_state, game_best, new_best, lost_on
+    lost_on = step + 1
+    print("SIGNAL: game over, score", game_score, "(timeout)" if timeout else "")
+    signal_off()
+    if not won:
+        leds.fill((255, 0, 0))
+        for f in (220, 175, 131):
+            beep(f, 0.18)
+        beep(98, 0.45)
+    leds.fill((0, 0, 0))
+    if game_score > game_best:
+        game_best = game_score
+        new_best = True
+        save_best(game_best)
+    game_state = "OVER"
+    draw()
+    resync_buttons()
+
+
+def game_press(i):
+    # Light and sound while the button is held.
+    signal_on(i)
+
+
+def game_release(i, held):
+    global step, input_deadline, game_state
+    signal_off()
+    if game_state != "PLAYING":
+        start_game()
+        return
+    if i == sequence[step]:
+        step += 1
+        input_deadline = time.monotonic() + INPUT_TIMEOUT
+        if step == len(sequence):
+            round_cleared()
+    else:
+        game_over()
+
+
+def enter_game():
+    global game_state, game_best
+    game_best = load_best()
+    game_state = "READY"
+    speaker_power(True)
+
+
+def leave_game():
+    global game_state
+    signal_off()
+    speaker_power(False)
+    game_state = "READY"
+    print("SIGNAL: exit")
+
+
+def game_overlay(group):
+    tile_text(group, "SIGNAL DECODER", 10, 6, "day")
+    best = "Best {}".format(game_best)
+    tile_text(group, best, 287 - 6 * len(best), 9, "text")
+    if game_state == "OVER":
+        center_text(group, str(game_score), 46, 40, "big")
+        center_text(group, "round" if game_score == 1 else "rounds", 46, 86, "text")
+        if game_score >= 99:
+            lines = ("Every step decoded. Flawless!", "")
+        elif new_best:
+            lines = ("New best! M-01 is impressed.", "")
+        else:
+            more = game_best - game_score + 1
+            lines = ("Signal lost on step {} of {}.".format(lost_on, len(sequence)),
+                     "{} more round{} to beat your best.".format(more, "" if more == 1 else "s"))
+        lines += ("", "Press any button to go again.", "Hold D to go back.")
+        for n, line in enumerate(lines):
+            tile_text(group, line, 96, 36 + n * 13, "text")
+    else:
+        lines = (
+            "M-01 picked up a coded signal. Watch",
+            "the lights and listen, then repeat",
+            "the pattern with the buttons. Each",
+            "round adds one more step.",
+            "Press any button to start. Hold D to exit.",
+        )
+        for n, line in enumerate(lines):
+            tile_text(group, line, 12, 31 + n * 14, "text")
+    for i, name in enumerate(SIGNAL_NAMES):
+        center_text(group, name, 37 + i * 74, 108, "text")
 
 
 fetch_weather()
 draw()
-print("READY: A Home (hold A sync) / B Forecast / C Today / D Reactor")
+print("READY: A Home (hold A sync) / B Forecast / C Today / D Signal game")
 
 while True:
     now = time.monotonic()
@@ -826,15 +1011,29 @@ while True:
         fetch_weather()
         dirty = True
 
+    if screen == "GAME":
+        # Holding D: once it has been held long enough, go quiet and dark so
+        # the player knows letting go will leave the game.
+        if last_pressed[3] and not ignore_entry_release and not exit_armed \
+                and now - button_down_at[3] >= HOLD_TO_EXIT:
+            exit_armed = True
+            signal_off()
+        if game_state == "PLAYING" and not any(last_pressed) and now > input_deadline:
+            game_over(timeout=True)
+            now = time.monotonic()
+
     for i, button in enumerate(buttons):
         pressed = not button.value
         if pressed and not last_pressed[i]:
             button_down_at[i] = now
-            if screen != "GAME":
+            if screen == "GAME":
+                if not ignore_entry_release:
+                    game_press(i)
+            else:
                 if i == 3:
                     screen = "GAME"
                     ignore_entry_release = True
-                    start_reactor()
+                    enter_game()
                 else:
                     screen = ("HOME", "FORECAST", "TODAY")[i]
                     flash((18, 18, 18), 0.25)
@@ -844,13 +1043,18 @@ while True:
             if screen == "GAME":
                 if i == 3 and ignore_entry_release:
                     ignore_entry_release = False
-                elif i == 3 and held >= 1.8:
+                elif i == 3 and exit_armed:
+                    exit_armed = False
+                    leave_game()
                     screen = "HOME"
-                    leds.fill((0, 0, 0))
-                    print("REACTOR: exit")
                     dirty = True
                 else:
-                    reactor_press(i)
+                    last_pressed[i] = pressed
+                    game_release(i, held)
+                    now = time.monotonic()
+                    # game_release may have played a whole round and
+                    # resynced the buttons; skip the rest of this scan.
+                    break
             elif i == 0 and held >= 1.8:
                 print("MANUAL WEATHER SYNC")
                 fetch_weather()

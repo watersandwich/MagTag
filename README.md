@@ -11,7 +11,20 @@ board, running CircuitPython. Weather comes from [Open-Meteo](https://open-meteo
 | A | Home: current temperature and conditions; the city outside M-01's window changes with the weather and time of day (hold ~2 s to refresh the weather) |
 | B | 5-day forecast with icons |
 | C | Today: a written forecast for the next 18 hours plus details (feels-like, wind, gusts, humidity, UV, sunrise/sunset) |
-| D | Reactor mini-game (hold D ~2 s to leave) |
+| D | Signal Decoder: a Simon-style memory game on the lights and speaker (hold D ~2 s to leave) |
+
+## Signal Decoder
+
+M-01 plays a pattern on the four NeoPixels, with a tone for each light: A red, B yellow,
+C green, D blue. Repeat it with the buttons. Each round adds one step and plays a little
+faster. A wrong button, or 6 seconds without a press, ends the game. Your best score is
+saved on the board and survives power-off.
+
+Settings at the top of `code.py`:
+
+- `SOUND = False` plays silently; `VOLUME` (0-32768) sets loudness.
+- `LED_FOR_BUTTON` sets which light sits above which button. If the lights come on in
+  reverse order on your board, change it to `(3, 2, 1, 0)`.
 
 ## Installing on the MagTag
 
@@ -23,6 +36,8 @@ Copy these to the root of the `CIRCUITPY` drive:
 
 The `lib/` folder needs `adafruit_requests`, `adafruit_connection_manager` and
 `neopixel` from the Adafruit CircuitPython library bundle.
+
+The game's sound uses the built-in `pwmio` module, so it needs no extra library.
 
 To change the location, edit `LATITUDE`, `LONGITUDE` and `LOCATION_LABEL` at the top of `code.py`.
 

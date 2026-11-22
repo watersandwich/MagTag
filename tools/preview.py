@@ -39,7 +39,7 @@ def make_stubs(saved_json):
     os.environ.setdefault("CIRCUITPY_WIFI_PASSWORD", "preview")
     board = types.ModuleType("board")
     for name in ("NEOPIXEL_POWER", "NEOPIXEL", "BUTTON_A", "BUTTON_B",
-                 "BUTTON_C", "BUTTON_D", "BATTERY"):
+                 "BUTTON_C", "BUTTON_D", "BATTERY", "SPEAKER", "SPEAKER_ENABLE"):
         setattr(board, name, _Pin())
     board.DISPLAY = _Display()
     m["board"] = board
@@ -104,6 +104,18 @@ def make_stubs(saved_json):
     dsp.OnDiskBitmap, dsp.Bitmap, dsp.Palette = OnDiskBitmap, Bitmap, Palette
     dsp.TileGrid, dsp.Group = TileGrid, Group
     m["displayio"] = dsp
+
+    pwm = types.ModuleType("pwmio")
+
+    class PWMOut:
+        def __init__(self, pin, frequency=440, duty_cycle=0, variable_frequency=False):
+            self.frequency, self.duty_cycle = frequency, duty_cycle
+    pwm.PWMOut = PWMOut
+    m["pwmio"] = pwm
+
+    mc = types.ModuleType("microcontroller")
+    mc.nvm = bytearray(256)
+    m["microcontroller"] = mc
 
     wifi = types.ModuleType("wifi")
     wifi.radio = types.SimpleNamespace(connected=True, connect=lambda s, p: None)
@@ -194,13 +206,20 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     overlays = {"HOME": "home_overlay", "FORECAST": "forecast_overlay",
                 "TODAY": "today_overlay"}
-    for name, fn in overlays.items():
+    shots = [(n, f, n.lower()) for n, f in overlays.items()]
+    shots.append(("GAME", "game_overlay", "game_start"))
+    shots.append(("GAME", "game_overlay", "game_over"))
+    for name, fn, out_name in shots:
+        if out_name == "game_over":
+            env["game_state"], env["game_score"], env["game_best"] = "OVER", 7, 9
+            env["sequence"][:] = [0] * 8
+            env["lost_on"] = 6
         group = env["displayio"].Group()
         bg = env["displayio"].OnDiskBitmap(env["backgrounds"][name])
         group.append(env["displayio"].TileGrid(bg))
         env[fn](group)
         img = render(group)
-        path = os.path.join(args.out, name.lower() + ".png")
+        path = os.path.join(args.out, out_name + ".png")
         img.resize((296 * args.scale, 128 * args.scale), Image.NEAREST).save(path)
         print("wrote", path)
     print("\n".join(env["narrative"](env["weather"])))
