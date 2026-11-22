@@ -1,5 +1,5 @@
-# OUTPOST // 01 v0.5 | Light contrast & larger 5-day forecast
-# A: Home (hold ~2 sec to retry weather) | B: Forecast | C: Logs | D: Reactor
+# OUTPOST // 01 v0.6 | Sharper weather icons & a plain-language Today screen
+# A: Home (hold ~2 sec to retry weather) | B: Forecast | C: Today | D: Reactor
 # In reactor: press A-D for cells, hold D ~2 sec to exit.
 # Original v0.3 M-01 robot and window kept pixel-identical (weather scene static).
 
@@ -30,7 +30,7 @@ RETRY_SECONDS = 5 * 60
 
 SSID = os.getenv("CIRCUITPY_WIFI_SSID")
 PASSWORD = os.getenv("CIRCUITPY_WIFI_PASSWORD")
-print("OUTPOST // 01 v0.5 booting - LIGHT INTERFACE")
+print("OUTPOST // 01 v0.6 booting - LIGHT INTERFACE")
 print("Weather location:", LOCATION_LABEL, "coordinates:", LATITUDE, LONGITUDE)
 print("Wi-Fi credentials found:", bool(SSID), bool(PASSWORD))
 
@@ -64,7 +64,7 @@ display = board.DISPLAY
 backgrounds = {
     "HOME": "/home.bmp",
     "FORECAST": "/forecast.bmp",
-    "LOGS": "/logs.bmp",
+    "TODAY": "/today.bmp",
     "GAME": "/reactor.bmp",
 }
 # Each tile sheet is a crisp raster monospace font on an appropriate background.
@@ -76,12 +76,23 @@ font_files = {
     "day": ("/day.bmp", "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789- ", 9, 17),
     "high": ("/high.bmp", "0123456789- ", 15, 27),
     "low": ("/low.bmp", "0123456789- ", 11, 18),
+    # Mixed-case 6x13 text (ASCII 32-126 plus a degree sign) for the Today screen.
+    "text": ("/text.bmp", "".join(chr(c) for c in range(32, 127)) + "\u00b0", 6, 13),
 }
 fonts = {}
 for style in font_files:
     path, chars, w, h = font_files[style]
     fonts[style] = (displayio.OnDiskBitmap(path), chars, w, h)
-icons_bitmap = displayio.OnDiskBitmap("/icons.bmp")
+# Icon sheets: 30x24 tiles for the forecast, 50x40 tiles for the Today screen.
+# Tile order is set by tools/make_assets.py and must match ICON_INDEX.
+icon_sheets = {
+    "small": (displayio.OnDiskBitmap("/icons.bmp"), 30, 24),
+    "big": (displayio.OnDiskBitmap("/icons_big.bmp"), 50, 40),
+}
+ICON_INDEX = {
+    "CLEAR": 0, "PARTLY": 1, "CLOUDY": 2, "FOG": 3, "DRIZZLE": 4,
+    "RAIN": 5, "SNOW": 6, "STORM": 7, "CLEAR_NIGHT": 8, "PARTLY_NIGHT": 9,
+}
 
 screen = "HOME"
 weather = None
@@ -106,18 +117,23 @@ def flash(color, duration=0.4):
 
 
 def tile_text(group, message, x, y, style="small"):
+    # One TileGrid per string (not per character) keeps memory use low.
     bmp, chars, w, h = fonts[style]
-    for ch in str(message).upper():
+    message = str(message)
+    if style != "text":
+        message = message.upper()
+    if not message:
+        return
+    blank = chars.find(" ")
+    grid = displayio.TileGrid(
+        bmp, pixel_shader=bmp.pixel_shader,
+        width=len(message), height=1, tile_width=w, tile_height=h,
+        x=x, y=y, default_tile=blank
+    )
+    for i, ch in enumerate(message):
         index = chars.find(ch)
-        if index < 0:
-            index = chars.find(" ")
-        tile = displayio.TileGrid(
-            bmp, pixel_shader=bmp.pixel_shader,
-            width=1, height=1, tile_width=w, tile_height=h,
-            x=x, y=y, default_tile=index
-        )
-        group.append(tile)
-        x += w
+        grid[i] = index if index >= 0 else blank
+    group.append(grid)
 
 
 def center_text(group, message, center, y, style):
@@ -125,13 +141,15 @@ def center_text(group, message, center, y, style):
     tile_text(group, message, center - width // 2, y, style)
 
 
-def weather_icon(group, code, center, y):
+def weather_icon(group, code, center, y, size="small", night=False):
+    bmp, w, h = icon_sheets[size]
     state = condition(code)
-    index = {"CLEAR": 0, "CLOUDY": 1, "RAIN": 2, "SNOW": 3}[state]
+    if night and state in ("CLEAR", "PARTLY"):
+        state += "_NIGHT"
     group.append(displayio.TileGrid(
-        icons_bitmap, pixel_shader=icons_bitmap.pixel_shader,
-        width=1, height=1, tile_width=22, tile_height=20,
-        x=center-11, y=y, default_tile=index
+        bmp, pixel_shader=bmp.pixel_shader,
+        width=1, height=1, tile_width=w, tile_height=h,
+        x=center - w // 2, y=y, default_tile=ICON_INDEX[state]
     ))
 
 def rect(group, x, y, w, h, color=0xFFFFFF):
@@ -142,24 +160,27 @@ def rect(group, x, y, w, h, color=0xFFFFFF):
 
 
 def condition(code):
+    # WMO weather codes as used by Open-Meteo.
     if code in (0, 1):
         return "CLEAR"
-    if code in (2, 3, 45, 48):
-        return "CLOUDY"  # includes fog until we make a dedicated fog scene
+    if code == 2:
+        return "PARTLY"
+    if code in (45, 48):
+        return "FOG"
+    if code in (51, 53, 55, 56, 57):
+        return "DRIZZLE"
+    if code in (61, 63, 65, 66, 67, 80, 81, 82):
+        return "RAIN"
     if code in (71, 73, 75, 77, 85, 86):
         return "SNOW"
-    if code in (51, 53, 55, 56, 57, 61, 63, 65, 66, 67,
-                80, 81, 82, 95, 96, 99):
-        return "RAIN"  # storm gets rainy art for now
+    if code in (95, 96, 99):
+        return "STORM"
     return "CLOUDY"
 
 
 def readable_condition(code):
-    if code in (45, 48):
-        return "FOG"
-    if code in (95, 96, 99):
-        return "STORM"
-    return condition(code)
+    state = condition(code)
+    return "PARTLY CLOUDY" if state == "PARTLY" else state
 
 
 def weekday(iso_date):
@@ -171,8 +192,9 @@ def weekday(iso_date):
     return ("SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT")[day]
 
 
-def short_condition(code):
-    return {"CLEAR": "SUN", "CLOUDY": "CLD", "RAIN": "RAN", "SNOW": "SNW"}.get(condition(code), "---")
+def num(value, default=0):
+    # Open-Meteo sends null for values it cannot forecast.
+    return default if value is None else value
 
 
 def battery_voltage():
@@ -241,10 +263,15 @@ def fetch_weather():
         url = (
             "https://api.open-meteo.com/v1/forecast"
             "?latitude={}&longitude={}"
-            "&current=temperature_2m,weather_code"
-            "&daily=temperature_2m_max,temperature_2m_min,weather_code"
-            "&temperature_unit=fahrenheit&timezone=auto"
-            "&forecast_days=5"
+            "&current=temperature_2m,apparent_temperature,relative_humidity_2m,"
+            "weather_code,wind_speed_10m,wind_direction_10m,wind_gusts_10m,is_day"
+            "&hourly=temperature_2m,precipitation_probability,precipitation,weather_code"
+            "&daily=temperature_2m_max,temperature_2m_min,weather_code,"
+            "precipitation_probability_max,sunrise,sunset,uv_index_max,"
+            "wind_speed_10m_max,wind_gusts_10m_max"
+            "&temperature_unit=fahrenheit&wind_speed_unit=mph"
+            "&precipitation_unit=inch&timezone=auto"
+            "&forecast_days=5&forecast_hours=24"
         ).format(LATITUDE, LONGITUDE)
         print("WEATHER: requesting forecast")
         response = s.get(url)
@@ -257,8 +284,19 @@ def fetch_weather():
             response.close()
         curr = data["current"]
         daily = data["daily"]
+        hourly = data["hourly"]
+        # Keep the next 24 hours from the current hour (ISO strings sort correctly).
+        now_hour = curr["time"][:13]
+        keep = [i for i, t in enumerate(hourly["time"]) if t[:13] >= now_hour][:24]
         weather = {
+            "time": curr["time"],
             "temp": round(curr["temperature_2m"]),
+            "feels": round(curr["apparent_temperature"]),
+            "humidity": round(curr["relative_humidity_2m"]),
+            "wind": round(curr["wind_speed_10m"]),
+            "wind_dir": curr["wind_direction_10m"],
+            "gust": round(curr["wind_gusts_10m"]),
+            "is_day": bool(curr["is_day"]),
             "code": int(curr["weather_code"]),
             "high": round(daily["temperature_2m_max"][0]),
             "low": round(daily["temperature_2m_min"][0]),
@@ -266,7 +304,19 @@ def fetch_weather():
             "highs": daily["temperature_2m_max"],
             "lows": daily["temperature_2m_min"],
             "codes": daily["weather_code"],
+            "rain_chance": num(daily["precipitation_probability_max"][0]),
+            "sunrise": daily["sunrise"][0],
+            "sunset": daily["sunset"][0],
+            "uv": num(daily["uv_index_max"][0]),
+            "wind_max": num(daily["wind_speed_10m_max"][0]),
+            "gust_max": num(daily["wind_gusts_10m_max"][0]),
+            "h_time": [hourly["time"][i] for i in keep],
+            "h_temp": [num(hourly["temperature_2m"][i]) for i in keep],
+            "h_pop": [num(hourly["precipitation_probability"][i]) for i in keep],
+            "h_rain": [num(hourly["precipitation"][i]) for i in keep],
+            "h_code": [int(num(hourly["weather_code"][i], 3)) for i in keep],
         }
+        del data, hourly
         status = "ONLINE"
         print("WEATHER OK:", weather["temp"], readable_condition(weather["code"]))
         print("SCENE:", condition(weather["code"]))
@@ -310,25 +360,346 @@ def forecast_overlay(group):
         return
     for i in range(min(5, len(weather["dates"]))):
         center = 37 + i*56
-        center_text(group, weekday(weather["dates"][i]), center, 32, "day")
-        weather_icon(group, int(weather["codes"][i]), center, 51)
+        center_text(group, weekday(weather["dates"][i]), center, 29, "day")
+        weather_icon(group, int(weather["codes"][i]), center, 45)
         hi = str(round(weather["highs"][i]))
         lo = str(round(weather["lows"][i]))
-        center_text(group, hi, center, 74, "high")
-        center_text(group, lo, center, 100, "low")
+        center_text(group, hi, center, 72, "high")
+        center_text(group, lo, center, 93, "low")
 
-def logs_overlay(group):
-    c = condition(weather["code"]) if weather else "UNKNOWN"
-    lines = {
-        "CLEAR": ("SOLAR ARRAYS AT NOMINAL", "HORIZON SCAN: COMPLETE", "M-01 PATROL: IN PROGRESS"),
-        "CLOUDY": ("CLOUD COVER ELEVATED", "DISTANT SIGNALS OBSCURED", "M-01 PATROL: STANDBY"),
-        "RAIN": ("PRECIPITATION DETECTED", "EXTERIOR PATROL SUSPENDED", "WINDOW SEALS HOLDING"),
-        "SNOW": ("SURFACE ICE DETECTED", "THERMAL LOOP ACTIVE", "M-01 PATROL: CANCELLED"),
-        "UNKNOWN": ("NO ENVIRONMENTAL FEED", "ANTENNA RETRY SCHEDULED", "M-01 STATUS: OPERATIONAL"),
-    }
-    for i, line in enumerate(lines.get(c, lines["UNKNOWN"])):
-        tile_text(group, line[:36], 23, 43 + i*18)
-    tile_text(group, "LINK/" + status, 16, 95)
+# ------------------- TODAY SCREEN (button C) --------------------------
+# Turns the next ~18 hours of forecast into a few plain-English sentences,
+# plus a row of details. Everything is computed on the MagTag from the data
+# fetched in fetch_weather().
+
+MONTHS = ("JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+          "JUL", "AUG", "SEP", "OCT", "NOV", "DEC")
+SEVERITY = {"CLEAR": 0, "PARTLY": 1, "CLOUDY": 2, "FOG": 3,
+            "DRIZZLE": 4, "RAIN": 5, "SNOW": 6, "STORM": 7}
+WET = ("DRIZZLE", "RAIN", "SNOW", "STORM")
+NOUN = {"DRIZZLE": "drizzle", "RAIN": "rain", "SNOW": "snow", "STORM": "storms"}
+DEG = "°"
+TEXT_COLS = 36   # characters that fit in the narrative column
+TEXT_LINES = 5
+HORIZON = 18     # hours the sky and rain sentences look ahead
+
+
+def cap(text):
+    return text[:1].upper() + text[1:]
+
+
+def hour_of(iso):
+    return int(iso[11:13])
+
+
+def fmt_hour(h):
+    h %= 24
+    if h == 0:
+        return "midnight"
+    if h == 12:
+        return "noon"
+    return "{}{}".format(h if h < 12 else h - 12, "am" if h < 12 else "pm")
+
+
+def fmt_clock(iso):
+    h, m = hour_of(iso), int(iso[14:16])
+    suffix = "a" if h < 12 else "p"
+    h = h % 12 or 12
+    return "{}:{:02d}{}".format(h, m, suffix)
+
+
+def compass(degrees):
+    points = ("N", "NE", "E", "SE", "S", "SW", "W", "NW")
+    return points[int((num(degrees) + 22.5) // 45) % 8]
+
+
+def period_name(iso, today):
+    h = hour_of(iso)
+    if iso[:10] == today:
+        if h < 5:
+            return "overnight"
+        if h < 12:
+            return "this morning"
+        if h < 17:
+            return "this afternoon"
+        if h < 21:
+            return "this evening"
+        return "tonight"
+    if h < 5:
+        return "tonight"
+    if h < 12:
+        return "tomorrow morning"
+    if h < 17:
+        return "tomorrow afternoon"
+    return "tomorrow evening"
+
+
+def is_night_hour(h, w):
+    return h < hour_of(w["sunrise"]) or h >= hour_of(w["sunset"])
+
+
+def periods(w):
+    """Group the hourly forecast into named periods with one sky category each."""
+    today = w["time"][:10]
+    groups = []
+    for i, iso in enumerate(w["h_time"][:HORIZON]):
+        name = period_name(iso, today)
+        if not groups or groups[-1][0] != name:
+            groups.append([name, []])
+        groups[-1][1].append(i)
+    result = []
+    for name, idx in groups:
+        counts = {}
+        wet = {}
+        for i in idx:
+            c = condition(w["h_code"][i])
+            counts[c] = counts.get(c, 0) + 1
+            if c in WET:
+                wet[c] = wet.get(c, 0) + 1
+        pool = counts
+        # Two or more wet hours (or one in a short period) make it a wet period.
+        if wet and (sum(wet.values()) >= 2 or len(idx) <= 2):
+            pool = wet
+        else:
+            for c in WET:
+                pool.pop(c, None)
+            if not pool:
+                pool = counts if counts else {"CLOUDY": 1}
+        best = None
+        for c in pool:
+            if best is None or (pool[c], SEVERITY[c]) > (pool[best], SEVERITY[best]):
+                best = c
+        nights = sum(1 for i in idx if is_night_hour(hour_of(w["h_time"][i]), w))
+        result.append((name, best, nights * 2 > len(idx)))
+    return result
+
+
+def sky_word(cat, night):
+    if cat == "CLEAR":
+        return "clear" if night else "sunny"
+    if cat == "PARTLY":
+        return "partly cloudy"
+    if cat == "FOG":
+        return "foggy"
+    return NOUN.get(cat, "cloudy")
+
+
+def sky_sentence(w):
+    segs = []
+    for name, cat, night in periods(w):
+        if segs and segs[-1][1] == cat:
+            segs[-1][3] = name           # extend the run to this period
+            segs[-1][4] = night
+        else:
+            segs.append([name, cat, night, name, night])
+    if not segs:
+        return ""
+    segs = segs[:3]
+    if len(segs) == 1:
+        first, cat, night, last, last_night = segs[0]
+        word = sky_word(cat, night)
+        if first == last:
+            return cap("{} {}.".format(word, first))
+        if cat == "CLEAR" and night != last_night:
+            when = "tomorrow" if last.startswith("tomorrow") else last
+            return cap("{} {}, then {} {}.".format(word, first, sky_word(cat, last_night), when))
+        return cap("{} through {}.".format(word, last))
+    parts = [cap("{} {}".format(sky_word(segs[0][1], segs[0][2]), segs[0][0]))]
+    prev = segs[0][1]
+    for first, cat, night, last, last_night in segs[1:]:
+        if cat == "CLEAR" and SEVERITY[prev] >= 2:
+            phrase = "clearing"
+        elif cat == "CLOUDY":
+            phrase = "drying out" if prev in WET else "clouding over"
+        elif cat == "FOG":
+            phrase = "fog developing"
+        elif cat in WET:
+            phrase = ("turning to " + NOUN[cat]) if prev in WET else (NOUN[cat] + " moving in")
+        else:
+            phrase = sky_word(cat, night)
+        parts.append("{} {}".format(phrase, first))
+        prev = cat
+    if len(parts) == 2:
+        return "{}, then {}.".format(parts[0], parts[1])
+    return "{}, {}, then {}.".format(parts[0], parts[1], parts[2])
+
+
+def precip_sentence(w):
+    pops = w["h_pop"][:HORIZON]
+    if not pops:
+        return ""
+    pmax = max(pops)
+    # Which kind of precipitation? Use the wettest hours' weather codes.
+    kind = None
+    for i, p in enumerate(pops):
+        c = condition(w["h_code"][i])
+        if c in WET and p >= 30 and (kind is None or SEVERITY[c] > SEVERITY[kind]):
+            kind = c
+    if kind is None:
+        kind = "SNOW" if min(w["h_temp"]) <= 32 else "RAIN"
+    noun = NOUN[kind]
+    times = w["h_time"]
+    if pmax < 20:
+        return "Staying dry."
+    if pmax < 50:
+        peak = pops.index(pmax)
+        word = "Slight chance" if pmax < 35 else "Chance"
+        return "{} of {} ({}%) around {}.".format(
+            word, noun, pmax, fmt_hour(hour_of(times[peak])))
+    start = None
+    end = None
+    for i, p in enumerate(pops):
+        if p >= 50:
+            if start is None:
+                start = i
+            end = i
+        elif start is not None:
+            break
+    last = len(pops) - 1
+    if start == 0 and end == last:
+        when = "for the next {} hours".format(len(pops))
+    elif start == 0:
+        when = "until " + fmt_hour(hour_of(times[end]) + 1)
+    elif end == last:
+        when = "from {} on".format(fmt_hour(hour_of(times[start])))
+    else:
+        when = "{}-{}".format(fmt_hour(hour_of(times[start])),
+                              fmt_hour(hour_of(times[end]) + 1))
+    text = "{} likely {} ({}%).".format(cap(noun), when, pmax)
+    total = sum(w["h_rain"][:HORIZON])
+    if total >= 0.05 and kind != "SNOW":
+        text += " About {:.1f}\" total.".format(total)
+    return text
+
+
+def temp_sentence(w):
+    temps = w["h_temp"]
+    times = w["h_time"]
+    if not temps:
+        return "High {}{}, low {}{}.".format(w["high"], DEG, w["low"], DEG)
+    today = w["time"][:10]
+    today_idx = [i for i, t in enumerate(times) if t[:10] == today]
+    first = ""
+    if today_idx:
+        peak = today_idx[0]
+        for i in today_idx:
+            if temps[i] > temps[peak]:
+                peak = i
+        if peak > 0 and temps[peak] >= w["temp"] + 2:
+            first = "High {}{} around {}".format(
+                round(temps[peak]), DEG, fmt_hour(hour_of(times[peak])))
+    # Overnight low: search up to noon tomorrow.
+    span = len(temps)
+    for i, t in enumerate(times):
+        if t[:10] != today and hour_of(t) >= 12:
+            span = i
+            break
+    span = max(span, 1)
+    lo = 0
+    for i in range(span):
+        if temps[i] < temps[lo]:
+            lo = i
+    edge = "by" if lo == span - 1 else "around"
+    low_text = "{}{} {} {}".format(round(temps[lo]), DEG, edge, fmt_hour(hour_of(times[lo])))
+    if first:
+        return "{}; low {}.".format(first, low_text)
+    if lo == span - 1:
+        return "Falling to {}.".format(low_text)
+    if lo == 0:
+        return "Temps holding near {}{}, high {}{} tomorrow.".format(
+            w["temp"], DEG, round(w["highs"][1]) if len(w["highs"]) > 1 else w["high"], DEG)
+    return "Low {}.".format(low_text)
+
+
+def extra_sentences(w):
+    out = []
+    diff = w["feels"] - w["temp"]
+    if diff <= -5:
+        out.append("Feels like {}{} with the wind.".format(w["feels"], DEG))
+    elif diff >= 5:
+        out.append("Feels like {}{} with the humidity.".format(w["feels"], DEG))
+    gust = round(max(w["gust_max"], w["gust"]))
+    if gust >= 35:
+        out.append("Very windy, gusts to {} mph.".format(gust))
+    elif gust >= 25:
+        out.append("Windy, gusts to {} mph.".format(gust))
+    elif w["wind_max"] >= 12:
+        out.append("Breezy at times.")
+    uv = round(w["uv"])
+    if uv >= 6 and hour_of(w["time"]) < 15:
+        out.append("{} UV ({}) midday; use sunscreen.".format(
+            "Very high" if uv >= 8 else "High", uv))
+    return out
+
+
+def wrap(text, cols):
+    lines = []
+    line = ""
+    for word in text.split(" "):
+        if not word:
+            continue
+        if line and len(line) + 1 + len(word) > cols:
+            lines.append(line)
+            line = word
+        else:
+            line = word if not line else line + " " + word
+    if line:
+        lines.append(line)
+    return lines
+
+
+def narrative(w):
+    """Sentences in priority order; stop adding when the column is full."""
+    text = ""
+    for sentence in [sky_sentence(w), precip_sentence(w), temp_sentence(w)] + extra_sentences(w):
+        if not sentence:
+            continue
+        candidate = sentence if not text else text + " " + sentence
+        if len(wrap(candidate, TEXT_COLS)) > TEXT_LINES:
+            continue
+        text = candidate
+    return wrap(text, TEXT_COLS)
+
+
+def today_overlay(group):
+    if not weather:
+        tile_text(group, "TODAY", 10, 6, "day")
+        tile_text(group, "No weather data yet.", 70, 50, "text")
+        tile_text(group, "Hold A for 2 seconds to retry.", 70, 64, "text")
+        return
+    w = weather
+    date = w["time"][:10]
+    title = "TODAY - {} {} {}".format(weekday(date), MONTHS[int(date[5:7]) - 1], int(date[8:10]))
+    tile_text(group, title, 10, 6, "day")
+    stamp = ("as of " if status == "ONLINE" else "offline ") + fmt_clock(w["time"])
+    tile_text(group, stamp, 287 - 6 * len(stamp), 9, "text")
+
+    # Left panel: current conditions.
+    weather_icon(group, w["code"], 33, 30, "big", night=not w["is_day"])
+    noun = "Snow" if w["low"] <= 32 else "Rain"
+    left = ("Now {}{}".format(w["temp"], DEG),
+            "Hi {}{}".format(w["high"], DEG),
+            "Lo {}{}".format(w["low"], DEG),
+            "{} {}%".format(noun, round(w["rain_chance"])))
+    for i, line in enumerate(left):
+        center_text(group, line, 33, 72 + i * 12, "text")
+
+    # Right panel: the written forecast.
+    for i, line in enumerate(narrative(w)):
+        tile_text(group, line, 67, 29 + i * 13, "text")
+
+    # Details, two rows of three columns.
+    cells = (
+        ("Feels {}{}".format(w["feels"], DEG),
+         "Wind {} {}".format(compass(w["wind_dir"]), w["wind"]),
+         "Gusts {}".format(w["gust"])),
+        ("Humid {}%".format(w["humidity"]),
+         "UV {}".format(round(w["uv"])),
+         "{}-{}".format(fmt_clock(w["sunrise"]), fmt_clock(w["sunset"]))),
+    )
+    for row, items in enumerate(cells):
+        for col, item in enumerate(items):
+            tile_text(group, item, 67 + col * 74, 98 + row * 12, "text")
 
 
 def game_overlay(group):
@@ -349,8 +720,8 @@ def draw():
         home_overlay(group)
     elif screen == "FORECAST":
         forecast_overlay(group)
-    elif screen == "LOGS":
-        logs_overlay(group)
+    elif screen == "TODAY":
+        today_overlay(group)
     elif screen == "GAME":
         game_overlay(group)
     display.root_group = group
@@ -412,7 +783,7 @@ def reactor_press(index):
 
 fetch_weather()
 draw()
-print("READY: A Home (hold A sync) / B Forecast / C Logs / D Reactor")
+print("READY: A Home (hold A sync) / B Forecast / C Today / D Reactor")
 
 while True:
     now = time.monotonic()
@@ -437,7 +808,7 @@ while True:
                     ignore_entry_release = True
                     start_reactor()
                 else:
-                    screen = ("HOME", "FORECAST", "LOGS")[i]
+                    screen = ("HOME", "FORECAST", "TODAY")[i]
                     flash((18, 18, 18), 0.25)
                 dirty = True
         elif not pressed and last_pressed[i]:
