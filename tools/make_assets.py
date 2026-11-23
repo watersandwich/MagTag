@@ -6,6 +6,7 @@ Writes into the repo root:
   icons.bmp      forecast icons, 10 tiles of 30x24 (4-level grayscale)
   icons_big.bmp  Today-screen icons, 10 tiles of 50x40
   text.bmp       6x13 mixed-case text font, ASCII 32-126 plus a degree sign
+  text_inv.bmp   the same font, white on black (home screen header bar)
   today.bmp      Button C "Today" screen background
   signal.bmp     Button D game screen background
   forecast.bmp   footer label updated to "C TODAY" (rest left untouched)
@@ -338,6 +339,7 @@ def main():
     big = icon_sheet(50, 40, "icons_big.bmp")
     if os.path.exists(args.font):
         font = font_sheet(args.font, "text.bmp")
+        save_bmp(font.point(lambda v: 255 - v), "text_inv.bmp")
     else:
         print("font not found, keeping existing text.bmp:", args.font)
         font = Image.open(os.path.join(ROOT, "text.bmp")).convert("L")

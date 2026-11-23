@@ -26,6 +26,33 @@ Settings at the top of `code.py`:
 - `LED_FOR_BUTTON` sets which light sits above which button. If the lights come on in
   reverse order on your board, change it to `(3, 2, 1, 0)`.
 
+## Battery and sleep
+
+The MagTag spends almost all its time in deep sleep. The e-ink screen keeps its picture
+with no power, so you won't see a difference.
+
+- **Every 30 minutes** (hourly from 11pm to 6am) it wakes, fetches the weather, redraws
+  the home screen and goes straight back to sleep. Status lights stay off during these
+  wakes so it never blinks at night.
+- **Any button** wakes it and shows that button's screen right away, using the saved
+  forecast without reconnecting to Wi-Fi. It stays awake for 60 seconds after your last
+  press, then returns to the home screen and sleeps. The game stays awake while you play
+  and gives up after 3 idle minutes.
+- **The home screen shows "awake 3:42p"** in the top bar: the last time the board woke
+  up. If that time is much more than an hour old, the board has stopped waking (usually
+  a flat battery).
+- **"OFFLINE"** in the top-right panel means the last update failed. It retries after
+  5 minutes, then 10, 20 and 30. **"LOW BAT"** appears below 3.5 V.
+- Wi-Fi is switched off between updates, and the lights and speaker are only powered
+  while in use.
+
+The timings are at the top of `code.py` (`UPDATE_SECONDS`, `NIGHT_UPDATE_SECONDS`,
+`AWAKE_SECONDS`, and so on).
+
+While the MagTag is plugged into a computer over USB, CircuitPython only pretends to
+deep sleep, so the serial console keeps working. The battery savings only apply on
+battery.
+
 ## Installing on the MagTag
 
 Copy these to the root of the `CIRCUITPY` drive:

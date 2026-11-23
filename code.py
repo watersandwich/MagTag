@@ -1,12 +1,17 @@
-# OUTPOST // 01 v0.6 | Sharper weather icons & a plain-language Today screen
+# OUTPOST // 01 v0.7 | Deep sleep between updates for long battery life
 # A: Home (hold ~2 sec to retry weather) | B: Forecast | C: Today | D: Signal game
+# The board deep-sleeps between weather updates; any button wakes it. The
+# e-ink screen keeps its picture with no power, so sleeping is invisible.
 # In the game: repeat the light/tone pattern with A-D; hold D ~2 sec to exit.
 # Original v0.3 M-01 robot and room kept pixel-identical; the view out the
 # window now follows the weather (scenes.bmp, made by tools/make_scenes.py).
 
 import os
 import gc
+import json
 import time
+import alarm
+import rtc
 import random
 import board
 import digitalio
@@ -32,25 +37,40 @@ VOLUME = 0x2000
 # Which NeoPixel sits above each button (A, B, C, D). If the game's lights
 # show up in reverse order on your board, change this to (3, 2, 1, 0).
 LED_FOR_BUTTON = (0, 1, 2, 3)
-UPDATE_SECONDS = 30 * 60
-RETRY_SECONDS = 5 * 60
+# Power. The board deep-sleeps between updates and wakes on a timer or a button.
+UPDATE_SECONDS = 30 * 60        # weather refresh during the day
+NIGHT_UPDATE_SECONDS = 60 * 60  # refresh overnight (NIGHT_START to NIGHT_END)
+NIGHT_START, NIGHT_END = 23, 6  # local hours
+RETRY_SECONDS = 5 * 60          # first retry after a failed update (then doubles)
+AWAKE_SECONDS = 60              # stay awake this long after the last button press
+GAME_IDLE_SECONDS = 180         # leave the game and sleep after this long idle
+LOW_BATTERY_VOLTS = 3.5         # show LOW BAT below this
 
 SSID = os.getenv("CIRCUITPY_WIFI_SSID")
 PASSWORD = os.getenv("CIRCUITPY_WIFI_PASSWORD")
-print("OUTPOST // 01 v0.6 booting - LIGHT INTERFACE")
+print("OUTPOST // 01 v0.7 booting - LIGHT INTERFACE")
 print("Weather location:", LOCATION_LABEL, "coordinates:", LATITUDE, LONGITUDE)
 print("Wi-Fi credentials found:", bool(SSID), bool(PASSWORD))
 
 # ------------------- HARDWARE ----------------------------------------
-# This board revision has an active-low NeoPixel power enable.
+# This board revision has an active-low NeoPixel power enable. The lights are
+# powered only while they are in use (status flashes and the game).
 led_power = digitalio.DigitalInOut(board.NEOPIXEL_POWER)
-led_power.switch_to_output(value=False)
+led_power.switch_to_output(value=True)
 leds = neopixel.NeoPixel(board.NEOPIXEL, 4, brightness=0.12)
-leds.fill((0, 0, 0))
 led_until = 0
 
+
+def pixels_power(on):
+    led_power.value = not on
+    if on:
+        time.sleep(0.005)
+    leds.fill((0, 0, 0))
+
+
+BUTTON_PINS = (board.BUTTON_A, board.BUTTON_B, board.BUTTON_C, board.BUTTON_D)
 buttons = []
-for pin in (board.BUTTON_A, board.BUTTON_B, board.BUTTON_C, board.BUTTON_D):
+for pin in BUTTON_PINS:
     b = digitalio.DigitalInOut(pin)
     b.switch_to_input(pull=digitalio.Pull.UP)
     buttons.append(b)
@@ -98,6 +118,8 @@ font_files = {
     "low": ("/low.bmp", "0123456789- ", 11, 18),
     # Mixed-case 6x13 text (ASCII 32-126 plus a degree sign) for the Today screen.
     "text": ("/text.bmp", "".join(chr(c) for c in range(32, 127)) + "\u00b0", 6, 13),
+    # The same font, white on black, for the home screen's dark header bar.
+    "text_inv": ("/text_inv.bmp", "".join(chr(c) for c in range(32, 127)) + "\u00b0", 6, 13),
 }
 fonts = {}
 for style in font_files:
@@ -125,17 +147,20 @@ ICON_INDEX = {
 screen = "HOME"
 weather = None
 status = "BOOT"
-last_fetch = -UPDATE_SECONDS
-next_retry = 0
+last_fetch = 0       # RTC time (seconds) of the last update attempt
+fail_count = 0       # failed updates in a row, for retry back-off
 session = None
+quiet = False        # no status flashes (timer wakes, so it never blinks at night)
+awake_until = 0      # time.monotonic() deadline before going back to sleep
 
 ignore_entry_release = False
 
 
 def flash(color, duration=0.4):
     global led_until
-    if screen == "GAME":
+    if screen == "GAME" or quiet:
         return
+    pixels_power(True)
     leds.fill(color)
     led_until = time.monotonic() + duration
 
@@ -166,7 +191,7 @@ def tile_text(group, message, x, y, style="small"):
     # One TileGrid per string (not per character) keeps memory use low.
     bmp, chars, w, h = fonts[style]
     message = str(message)
-    if style != "text":
+    if not style.startswith("text"):
         message = message.upper()
     if not message:
         return
@@ -282,11 +307,136 @@ def battery_overlay(group):
     else:
         tile_text(group, "{:.1f}V".format(voltage), 258, 7)
     print("BATTERY:", "unavailable" if voltage is None else "{:.2f} V".format(voltage))
+    return voltage
+
+
+# ------------------- CLOCK, SLEEP MEMORY, DEEP SLEEP -------------------
+# The real-time clock is set from the weather server's reply on every update
+# and keeps running through deep sleep. It is used for the "awake" stamp on
+# the home screen and for scheduling the next update.
+MONTH_NAMES = ("JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+               "JUL", "AUG", "SEP", "OCT", "NOV", "DEC")
+
+
+def clock_ok():
+    return time.localtime().tm_year >= 2025
+
+
+def set_clock(date_header, utc_offset):
+    # date_header looks like "Sun, 22 Nov 2026 20:15:31 GMT"
+    try:
+        parts = date_header.split()
+        hh, mm, ss = [int(n) for n in parts[4].split(":")]
+        month = MONTH_NAMES.index(parts[2].upper()[:3]) + 1
+        utc = time.mktime((int(parts[3]), month, int(parts[1]), hh, mm, ss, 0, -1, -1))
+        rtc.RTC().datetime = time.localtime(utc + int(utc_offset))
+        print("CLOCK: set to", fmt_time(time.localtime()))
+    except Exception as error:
+        print("CLOCK ERROR:", repr(error), date_header)
+
+
+def fmt_time(t):
+    h = t.tm_hour % 12 or 12
+    return "{}:{:02d}{}".format(h, t.tm_min, "a" if t.tm_hour < 12 else "p")
+
+
+def update_interval():
+    if clock_ok():
+        h = time.localtime().tm_hour
+        if h >= NIGHT_START or h < NIGHT_END:
+            return NIGHT_UPDATE_SECONDS
+    return UPDATE_SECONDS
+
+
+def seconds_until_update():
+    if fail_count:
+        wait = min(RETRY_SECONDS * (2 ** (fail_count - 1)), update_interval())
+    else:
+        wait = update_interval()
+    now = time.time()
+    if last_fetch > now:          # clock went backwards: update now
+        return 0
+    return max(0, last_fetch + wait - now)
+
+
+# Weather and schedule are kept in alarm.sleep_memory, which survives deep
+# sleep (but not a reset or power loss), so a button wake can redraw a screen
+# without reconnecting to Wi-Fi.
+def save_state():
+    try:
+        blob = json.dumps({"w": weather, "f": last_fetch, "n": fail_count,
+                           "s": status}).encode()
+        mem = alarm.sleep_memory
+        if len(blob) + 4 > len(mem):
+            print("SLEEP MEMORY: weather too big to keep ({} bytes)".format(len(blob)))
+            blob = json.dumps({"w": None, "f": last_fetch, "n": fail_count,
+                               "s": status}).encode()
+        mem[0:4] = bytes((0x4F, 0x31, len(blob) >> 8, len(blob) & 255))
+        mem[4:4 + len(blob)] = blob
+    except Exception as error:
+        print("SLEEP MEMORY WRITE ERROR:", repr(error))
+
+
+def load_state():
+    global weather, last_fetch, fail_count, status
+    try:
+        mem = alarm.sleep_memory
+        if mem[0] != 0x4F or mem[1] != 0x31:
+            return
+        size = (mem[2] << 8) | mem[3]
+        data = json.loads(bytes(mem[4:4 + size]).decode())
+        weather = data["w"]
+        last_fetch = data["f"]
+        fail_count = data["n"]
+        status = data["s"]
+        print("SLEEP MEMORY: restored, weather", "yes" if weather else "no")
+    except Exception as error:
+        print("SLEEP MEMORY READ ERROR:", repr(error))
+
+
+def go_to_sleep():
+    global screen
+    if screen == "GAME":
+        leave_game()
+    if screen != "HOME":
+        # Always sleep on the home screen, so the awake stamp is visible.
+        screen = "HOME"
+        draw()
+    save_state()
+    wait = max(60, seconds_until_update())
+    print("SLEEP: next update in {} min; any button wakes".format(int(wait // 60)))
+    pixels_power(False)
+    if speaker_enable is not None:
+        speaker_enable.value = False
+    try:
+        wifi.radio.enabled = False
+    except Exception:
+        pass
+    for b in buttons:
+        b.deinit()
+    timer = alarm.time.TimeAlarm(monotonic_time=time.monotonic() + wait)
+    keep = [led_power] + ([speaker_enable] if speaker_enable is not None else [])
+    # Wake on any of the four buttons. If this chip/firmware cannot wake on
+    # several pins from deep sleep, fall back to button A alone.
+    for pins in (BUTTON_PINS, BUTTON_PINS[:1]):
+        try:
+            pin_alarms = [alarm.pin.PinAlarm(pin=p, value=False, pull=True) for p in pins]
+            try:
+                alarm.exit_and_deep_sleep_until_alarms(timer, *pin_alarms,
+                                                       preserve_dios=keep)
+            except TypeError:  # older firmware without preserve_dios
+                alarm.exit_and_deep_sleep_until_alarms(timer, *pin_alarms)
+        except (ValueError, NotImplementedError, RuntimeError) as error:
+            # Raised when this pin combination can't wake the chip.
+            print("SLEEP: cannot wake on", len(pins), "buttons:", repr(error))
+    alarm.exit_and_deep_sleep_until_alarms(timer)
 
 def get_session():
     global session
     if not SSID or not PASSWORD:
         raise ValueError("Wi-Fi missing in settings.toml")
+    if not wifi.radio.enabled:
+        wifi.radio.enabled = True
     if not wifi.radio.connected:
         print("WIFI: connecting...")
         wifi.radio.connect(SSID, PASSWORD)
@@ -298,11 +448,22 @@ def get_session():
     return session
 
 
+def wifi_off():
+    global session
+    try:
+        adafruit_connection_manager.connection_manager_close_all(release_references=True)
+    except Exception:
+        pass
+    session = None
+    try:
+        wifi.radio.enabled = False
+    except Exception as error:
+        print("WIFI OFF ERROR:", repr(error))
+
+
 def fetch_weather():
-    global weather, status, last_fetch, next_retry
+    global weather, status, last_fetch, fail_count
     print("WEATHER: starting Open-Meteo request")
-    last_fetch = time.monotonic()
-    next_retry = 0
     flash((0, 0, 60), 0.7)
     try:
         s = get_session()
@@ -326,8 +487,14 @@ def fetch_weather():
             if response.status_code != 200:
                 raise ValueError("Forecast API HTTP " + str(response.status_code))
             data = response.json()
+            date_header = None
+            for key in response.headers:
+                if key.lower() == "date":
+                    date_header = response.headers[key]
         finally:
             response.close()
+        if date_header:
+            set_clock(date_header, data.get("utc_offset_seconds", 0))
         curr = data["current"]
         daily = data["daily"]
         hourly = data["hourly"]
@@ -364,14 +531,16 @@ def fetch_weather():
         }
         del data, hourly
         status = "ONLINE"
+        fail_count = 0
         print("WEATHER OK:", weather["temp"], readable_condition(weather["code"]))
         flash((0, 65, 0), 0.9)
     except Exception as error:
         status = "OFFLINE"
-        next_retry = time.monotonic() + RETRY_SECONDS
+        fail_count += 1
         print("WEATHER ERROR:", repr(error))
-        print("WEATHER: will retry in five minutes")
         flash((65, 0, 0), 1.0)
+    last_fetch = time.time()
+    wifi_off()
     gc.collect()
 
 
@@ -396,14 +565,28 @@ def home_overlay(group):
             width=1, height=1, tile_width=SCENE_W, tile_height=SCENE_H,
             x=SCENE_X, y=SCENE_Y, default_tile=SCENE_INDEX[scene]
         ))
-    # Original M-01 robot/window pixels are unchanged. Header shows weather location.
+    # Header bar: location on the left, and when the MagTag last woke up on the
+    # right (in place of the old "M-01 /////" decoration). If this time is
+    # well over an hour old, the board has stopped waking up.
     city = "".join(c if c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789- " else " "
                    for c in LOCATION_LABEL.upper()).strip()
-    if len(city) <= 11:
+    if len(city) <= 9:
         tile_text(group, city, 10, 6, "header")
     else:
-        tile_text(group, city[:14], 10, 7, "small")
-    battery_overlay(group)
+        tile_text(group, LOCATION_LABEL[:14], 10, 7, "text_inv")
+    rect(group, 100, 5, 70, 15, 0x000000)
+    stamp = "awake " + (fmt_time(time.localtime()) if clock_ok() else "--:--")
+    tile_text(group, stamp, 168 - 6 * len(stamp), 7, "text_inv")
+    voltage = battery_overlay(group)
+    # Status slot (where "WX" is printed): problems first.
+    flag = None
+    if status == "OFFLINE":
+        flag = "OFFLINE"
+    elif voltage is not None and 2.8 <= voltage < LOW_BATTERY_VOLTS:
+        flag = "LOW BAT"
+    if flag:
+        rect(group, 180, 9, 50, 12)
+        tile_text(group, flag, 181, 7)
     temp = "--" if weather is None else str(weather["temp"])
     temp = temp[:3]
     # Right-align large temperature before the permanently drawn degree-F unit.
@@ -951,6 +1134,7 @@ def enter_game():
     global game_state, game_best
     game_best = load_best()
     game_state = "READY"
+    pixels_power(True)
     speaker_power(True)
 
 
@@ -958,6 +1142,7 @@ def leave_game():
     global game_state
     signal_off()
     speaker_power(False)
+    pixels_power(False)
     game_state = "READY"
     print("SIGNAL: exit")
 
@@ -994,23 +1179,59 @@ def game_overlay(group):
         center_text(group, name, 37 + i * 74, 108, "text")
 
 
-fetch_weather()
+# ------------------- STARTUP -------------------------------------------
+# Every wake from deep sleep starts code.py from the top. Work out why we
+# woke up, restore the saved weather, and decide what to show.
+wake = alarm.wake_alarm
+woke_button = None
+if isinstance(wake, alarm.pin.PinAlarm):
+    for i, pin in enumerate(BUTTON_PINS):
+        if wake.pin == pin:
+            woke_button = i
+woke_by_timer = isinstance(wake, alarm.time.TimeAlarm)
+print("WAKE:", "button " + "ABCD"[woke_button] if woke_button is not None
+      else ("timer" if woke_by_timer else "power on / reset"))
+if wake is not None:
+    load_state()
+if not clock_ok():
+    last_fetch = 0               # unknown clock: treat saved data as stale
+
+if woke_by_timer:
+    # Scheduled update: fetch quietly, redraw home, straight back to sleep.
+    quiet = True
+    fetch_weather()
+    draw()
+    go_to_sleep()
+
+if weather is None or seconds_until_update() == 0:
+    fetch_weather()
+if woke_button == 3:
+    screen = "GAME"
+    enter_game()
+elif woke_button is not None:
+    screen = ("HOME", "FORECAST", "TODAY")[woke_button]
 draw()
+awake_until = time.monotonic() + AWAKE_SECONDS
+# Don't treat the button that woke us as a fresh press.
+for i, b in enumerate(buttons):
+    last_pressed[i] = not b.value
+    button_down_at[i] = time.monotonic()
 print("READY: A Home (hold A sync) / B Forecast / C Today / D Signal game")
 
 while True:
     now = time.monotonic()
     if screen != "GAME" and led_until and now >= led_until:
-        leds.fill((0, 0, 0))
+        pixels_power(False)
         led_until = 0
 
     dirty = False
-    should_retry = next_retry and now >= next_retry
-    should_update = now - last_fetch >= UPDATE_SECONDS
-    if screen != "GAME" and (should_retry or should_update):
+    if screen != "GAME" and seconds_until_update() == 0:
         fetch_weather()
         dirty = True
 
+    # Back to sleep once nobody has touched a button for a while.
+    if not any(last_pressed) and now >= awake_until and not dirty:
+        go_to_sleep()
     if screen == "GAME":
         # Holding D: once it has been held long enough, go quiet and dark so
         # the player knows letting go will leave the game.
@@ -1024,6 +1245,9 @@ while True:
 
     for i, button in enumerate(buttons):
         pressed = not button.value
+        if pressed != last_pressed[i]:
+            idle = GAME_IDLE_SECONDS if screen == "GAME" or (i == 3 and pressed) else AWAKE_SECONDS
+            awake_until = now + idle
         if pressed and not last_pressed[i]:
             button_down_at[i] = now
             if screen == "GAME":

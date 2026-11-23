@@ -57,6 +57,9 @@ def make_stubs(saved_json):
 
         def switch_to_input(self, pull=None):
             pass
+
+        def deinit(self):
+            pass
     dio.DigitalInOut = DigitalInOut
     dio.Pull = types.SimpleNamespace(UP=1)
     m["digitalio"] = dio
@@ -113,18 +116,48 @@ def make_stubs(saved_json):
     pwm.PWMOut = PWMOut
     m["pwmio"] = pwm
 
+    al = types.ModuleType("alarm")
+
+    class DeepSleep(BaseException):
+        """Like CircuitPython's DeepSleepRequest: not caught by `except Exception`."""
+
+    class PinAlarm:
+        def __init__(self, pin=None, value=False, pull=False):
+            self.pin = pin
+
+    class TimeAlarm:
+        def __init__(self, monotonic_time=None, epoch_time=None):
+            self.monotonic_time = monotonic_time
+
+    def deep_sleep(*alarms, preserve_dios=()):
+        raise DeepSleep(alarms)
+    al.DeepSleep = DeepSleep
+    al.wake_alarm = None
+    al.sleep_memory = bytearray(8192)
+    al.pin = types.SimpleNamespace(PinAlarm=PinAlarm)
+    al.time = types.SimpleNamespace(TimeAlarm=TimeAlarm)
+    al.exit_and_deep_sleep_until_alarms = deep_sleep
+    m["alarm"] = al
+
+    rt = types.ModuleType("rtc")
+
+    class RTC:
+        datetime = None
+    rt.RTC = RTC
+    m["rtc"] = rt
+
     mc = types.ModuleType("microcontroller")
     mc.nvm = bytearray(256)
     m["microcontroller"] = mc
 
     wifi = types.ModuleType("wifi")
-    wifi.radio = types.SimpleNamespace(connected=True, connect=lambda s, p: None)
+    wifi.radio = types.SimpleNamespace(connected=True, enabled=True, connect=lambda s, p: None)
     m["wifi"] = wifi
 
     neo = types.ModuleType("neopixel")
 
     class NeoPixel(list):
-        def __init__(self, pin, n, brightness=1):
+        def __init__(self, pin, n, brightness=1, **kw):
             super().__init__([(0, 0, 0)] * n)
 
         def fill(self, c):
@@ -143,6 +176,7 @@ def make_stubs(saved_json):
         def __init__(self, body):
             self.status_code = 200
             self._body = body
+            self.headers = {"date": "Sun, 22 Nov 2026 20:15:31 GMT"}
 
         def json(self):
             return json.loads(self._body)
@@ -192,7 +226,7 @@ def main():
     make_stubs(args.json)
 
     src = open(os.path.join(ROOT, "code.py")).read()
-    src = src[:src.index("\nfetch_weather()\ndraw()")]   # stop before the main loop
+    src = src[:src.index("# ------------------- STARTUP")]   # stop before startup/main loop
     env = {"__name__": "magtag"}
     cwd = os.getcwd()
     os.chdir(ROOT)
