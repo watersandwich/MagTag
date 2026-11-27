@@ -1,0 +1,18 @@
+# Copy this file to the CIRCUITPY drive as settings.toml and fill in your own
+# networks. Keep the quotes. The MagTag tries the network that worked last
+# time first, then whichever of the others it can see, strongest signal first.
+
+# Network 1 (CircuitPython also uses this one for its own web tools).
+CIRCUITPY_WIFI_SSID = "Home network name"
+CIRCUITPY_WIFI_PASSWORD = "home password"
+
+# More networks: number them 2, 3, 4 ... up to 9. Delete any you don't need.
+WIFI_SSID_2 = "Work network name"
+WIFI_PASSWORD_2 = "work password"
+
+WIFI_SSID_3 = "Phone hotspot name"
+WIFI_PASSWORD_3 = "hotspot password"
+
+# An open network with no password:
+# WIFI_SSID_4 = "Library WiFi"
+# WIFI_PASSWORD_4 = ""

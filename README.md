@@ -59,7 +59,10 @@ Copy these to the root of the `CIRCUITPY` drive:
 
 - `code.py`
 - every `.bmp` file in this repo
-- `settings.toml` with your own Wi-Fi details (`CIRCUITPY_WIFI_SSID`, `CIRCUITPY_WIFI_PASSWORD`)
+- `settings.toml` with your own Wi-Fi details. See `settings.toml.example`: the first network
+  is `CIRCUITPY_WIFI_SSID` / `CIRCUITPY_WIFI_PASSWORD`, and you can add more as
+  `WIFI_SSID_2` / `WIFI_PASSWORD_2` up to `_9`. The MagTag tries the network that worked
+  last time first, then the others it can see, strongest signal first.
 
 The `lib/` folder needs `adafruit_requests`, `adafruit_connection_manager` and
 `neopixel` from the Adafruit CircuitPython library bundle.

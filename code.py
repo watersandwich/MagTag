@@ -46,11 +46,18 @@ AWAKE_SECONDS = 60              # stay awake this long after the last button pre
 GAME_IDLE_SECONDS = 180         # leave the game and sleep after this long idle
 LOW_BATTERY_VOLTS = 3.5         # show LOW BAT below this
 
-SSID = os.getenv("CIRCUITPY_WIFI_SSID")
-PASSWORD = os.getenv("CIRCUITPY_WIFI_PASSWORD")
+# Wi-Fi networks from settings.toml. The first is CIRCUITPY_WIFI_SSID /
+# CIRCUITPY_WIFI_PASSWORD; add more as WIFI_SSID_2 / WIFI_PASSWORD_2, up to
+# WIFI_SSID_9. Leave a password empty ("") for an open network.
+NETWORKS = []
+for _ssid, _pw in [("CIRCUITPY_WIFI_SSID", "CIRCUITPY_WIFI_PASSWORD")] + [
+        ("WIFI_SSID_{}".format(n), "WIFI_PASSWORD_{}".format(n)) for n in range(2, 10)]:
+    if os.getenv(_ssid):
+        NETWORKS.append((os.getenv(_ssid), os.getenv(_pw) or ""))
+last_network = None  # the network that worked last time (kept through sleep)
 print("OUTPOST // 01 v0.7 booting - LIGHT INTERFACE")
 print("Weather location:", LOCATION_LABEL, "coordinates:", LATITUDE, LONGITUDE)
-print("Wi-Fi credentials found:", bool(SSID), bool(PASSWORD))
+print("Wi-Fi networks configured:", ", ".join(n[0] for n in NETWORKS) or "none")
 
 # ------------------- HARDWARE ----------------------------------------
 # This board revision has an active-low NeoPixel power enable. The lights are
@@ -365,12 +372,12 @@ def seconds_until_update():
 def save_state():
     try:
         blob = json.dumps({"w": weather, "f": last_fetch, "n": fail_count,
-                           "s": status}).encode()
+                           "s": status, "k": last_network}).encode()
         mem = alarm.sleep_memory
         if len(blob) + 4 > len(mem):
             print("SLEEP MEMORY: weather too big to keep ({} bytes)".format(len(blob)))
             blob = json.dumps({"w": None, "f": last_fetch, "n": fail_count,
-                               "s": status}).encode()
+                               "s": status, "k": last_network}).encode()
         mem[0:4] = bytes((0x4F, 0x31, len(blob) >> 8, len(blob) & 255))
         mem[4:4 + len(blob)] = blob
     except Exception as error:
@@ -378,7 +385,7 @@ def save_state():
 
 
 def load_state():
-    global weather, last_fetch, fail_count, status
+    global weather, last_fetch, fail_count, status, last_network
     try:
         mem = alarm.sleep_memory
         if mem[0] != 0x4F or mem[1] != 0x31:
@@ -389,6 +396,7 @@ def load_state():
         last_fetch = data["f"]
         fail_count = data["n"]
         status = data["s"]
+        last_network = data.get("k")
         print("SLEEP MEMORY: restored, weather", "yes" if weather else "no")
     except Exception as error:
         print("SLEEP MEMORY READ ERROR:", repr(error))
@@ -431,16 +439,66 @@ def go_to_sleep():
             print("SLEEP: cannot wake on", len(pins), "buttons:", repr(error))
     alarm.exit_and_deep_sleep_until_alarms(timer)
 
+def try_network(net):
+    global last_network
+    print("WIFI: trying", net[0])
+    try:
+        wifi.radio.connect(net[0], net[1], timeout=10)
+        last_network = net[0]
+        print("WIFI: connected to", net[0])
+        return True
+    except Exception as error:
+        print("WIFI: could not join", net[0], repr(error))
+        return False
+
+
+def visible_networks():
+    # Strongest signal seen for each network name nearby, or None if the scan failed.
+    try:
+        seen = {}
+        for found in wifi.radio.start_scanning_networks():
+            if found.ssid:
+                seen[found.ssid] = max(seen.get(found.ssid, -999), found.rssi)
+        wifi.radio.stop_scanning_networks()
+        return seen
+    except Exception as error:
+        print("WIFI SCAN ERROR:", repr(error))
+        return None
+
+
+def connect_wifi():
+    if not NETWORKS:
+        raise ValueError("No Wi-Fi network in settings.toml")
+    # Most wakes happen in the same place as last time, so try that network
+    # first without scanning; it's the quickest and uses the least battery.
+    tried = []
+    for net in NETWORKS:
+        if net[0] == last_network:
+            if try_network(net):
+                return
+            tried.append(net[0])
+    candidates = [n for n in NETWORKS if n[0] not in tried]
+    seen = visible_networks()
+    if seen:
+        nearby = [n for n in candidates if n[0] in seen]
+        nearby.sort(key=lambda n: -seen[n[0]])  # strongest signal first
+        if nearby:
+            print("WIFI: in range:", ", ".join(n[0] for n in nearby))
+            candidates = nearby
+        # If none of ours showed up, still try them all: hidden networks
+        # don't appear in scans.
+    for net in candidates:
+        if try_network(net):
+            return
+    raise ConnectionError("could not join any of {} Wi-Fi networks".format(len(NETWORKS)))
+
+
 def get_session():
     global session
-    if not SSID or not PASSWORD:
-        raise ValueError("Wi-Fi missing in settings.toml")
     if not wifi.radio.enabled:
         wifi.radio.enabled = True
     if not wifi.radio.connected:
-        print("WIFI: connecting...")
-        wifi.radio.connect(SSID, PASSWORD)
-        print("WIFI: connected")
+        connect_wifi()
     if session is None:
         pool = adafruit_connection_manager.get_radio_socketpool(wifi.radio)
         ssl_context = adafruit_connection_manager.get_radio_ssl_context(wifi.radio)
